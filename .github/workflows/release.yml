@@ -173,6 +173,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.event.inputs.tag || github.ref_name }}
+          NOTARIZE: ${{ env.NOTARIZE }}
         run: |
           set -euo pipefail
           NOTES=$(mktemp)
@@ -183,11 +184,34 @@ jobs:
             echo
             echo "Drag Mac.apk into Applications, then open it and click Install next to Runtime."
           } > "$NOTES"
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" build/dist/macapk.dmg --clobber
+          if [ "$NOTARIZE" = "1" ]; then
+            # Signed and notarized: this is what a public release wants.
+            if gh release view "$TAG" >/dev/null 2>&1; then
+              gh release upload "$TAG" build/dist/macapk.dmg --clobber
+            else
+              gh release create "$TAG" build/dist/macapk.dmg \
+                --title "Mac.apk $VERSION" --notes-file "$NOTES"
+            fi
           else
-            gh release create "$TAG" build/dist/macapk.dmg \
-              --title "Mac.apk $VERSION" --notes-file "$NOTES"
+            # AD-HOC SIGNED. A copy that arrives with a quarantine flag is
+            # refused by Gatekeeper, so publishing this to the world would
+            # hand out a file nobody can open. It is staged as a DRAFT
+            # instead: the artifact exists, and publishing it is one click
+            # away once there is a signing identity and a notarization.
+            {
+              echo
+              echo "> [!WARNING]"
+              echo "> This build is **ad-hoc signed**, not Developer ID signed and"
+              echo "> not notarized, so macOS Gatekeeper refuses a downloaded copy"
+              echo "> (\"the app is damaged\"). It is a DRAFT for that reason."
+              echo "> Add the signing and notary secrets to produce a shippable build."
+            } >> "$NOTES"
+            if gh release view "$TAG" >/dev/null 2>&1; then
+              gh release upload "$TAG" build/dist/macapk.dmg --clobber
+            else
+              gh release create "$TAG" build/dist/macapk.dmg --draft \
+                --title "Mac.apk $VERSION (draft, ad-hoc signed)" --notes-file "$NOTES"
+            fi
           fi
           gh release view "$TAG"
 
