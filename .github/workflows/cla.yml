@@ -25,6 +25,6 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           path-to-signatures: 'signatures/cla.json'
-          path-to-document: 'https://github.com/kksimp/Mac.apk/blob/main/CLA.md'
+          path-to-document: 'https://github.com/9v2/APK-on-MAC/blob/main/CLA.md'
           branch: 'main'
-          allowlist: kksimp,bot*
+          allowlist: 9v2,kksimp,bot*

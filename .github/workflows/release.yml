@@ -1,0 +1,207 @@
+# Publish a Mac.apk release.
+#
+# TRIGGER: a version tag, "v<VERSION>" (VERSION file), e.g. v1.0.2279. The
+# launcher compares the baked-in release version against the latest GitHub
+# Release to decide whether to offer an update, so the tag and the VERSION
+# file have to agree -- the build fails loudly if they do not.
+#
+# The build itself lives in .github/actions/build-macapk/action.yml, shared
+# with ci.yml.
+#
+# SIGNING AND NOTARIZATION. They are OPTIONAL, and the build adapts:
+#
+#   * No signing secrets -> the app is ad-hoc signed. It runs on the machine
+#     that built it, but a downloaded copy is Gatekeeper-quarantined.
+#   * MACAPK_SIGN_IDENTITY + a certificate -> Developer ID signed, so it
+#     opens on any Mac.
+#   * The notary secrets on top of that -> notarized and stapled, which is
+#     what a public release wants.
+#
+# To turn it on, add these repository secrets:
+#
+#   MACAPK_CERT_P12        base64 of the Developer ID Application .p12
+#   MACAPK_CERT_PASSWORD   password of that .p12
+#   MACAPK_SIGN_IDENTITY   the identity string, e.g.
+#                          "Developer ID Application: Name (TEAMID)"
+#   MACAPK_NOTARY_KEY      base64 of the App Store Connect .p8 API key
+#   MACAPK_NOTARY_KEY_ID   the key id (the XXXXXXXXXX in AuthKey_XXXXXXXXXX)
+#   MACAPK_NOTARY_ISSUER   the issuer uuid
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to publish (v<VERSION>)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Release
+    runs-on: macos-26
+    timeout-minutes: 90
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      # The tag and the VERSION file are two halves of the same version
+      # number: the tag names the release, the file bakes the number into the
+      # launcher for the update check. If they drift, the update check compares
+      # against a version that does not exist.
+      - name: Check the tag against VERSION
+        env:
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          VERSION="$(tr -d '[:space:]' < VERSION)"
+          echo "VERSION file: $VERSION"
+          echo "tag:           $TAG"
+          if [ "$TAG" != "v$VERSION" ]; then
+            echo "ERROR: tag '$TAG' does not match VERSION '$VERSION' (expected 'v$VERSION')" >&2
+            exit 1
+          fi
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+
+      # Import the Developer ID certificate into a temporary keychain, if one
+      # was provided. A temporary keychain is used (not the login one) so the
+      # runner is left as it was found, and the keychain is deleted at the end.
+      - name: Import the signing certificate
+        id: signing
+        shell: bash
+        env:
+          CERT_P12: ${{ secrets.MACAPK_CERT_P12 }}
+          CERT_PASSWORD: ${{ secrets.MACAPK_CERT_PASSWORD }}
+          SIGN_IDENTITY: ${{ secrets.MACAPK_SIGN_IDENTITY }}
+        run: |
+          set -euo pipefail
+          if [ -z "$CERT_P12" ] || [ -z "$SIGN_IDENTITY" ]; then
+            echo "No MACAPK_CERT_P12 / MACAPK_SIGN_IDENTITY secret: building AD-HOC signed."
+            echo "AD_HOC=1" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          KEYCHAIN="$RUNNER_TEMP/macapk.keychain-db"
+          {
+            echo "MACAPK_KEYCHAIN=$KEYCHAIN"
+            echo "MACAPK_SIGN_IDENTITY=$SIGN_IDENTITY"
+            echo "AD_HOC=0"
+          } >> "$GITHUB_ENV"
+
+          security create-keychain -p "ci-notary-keychain" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "ci-notary-keychain" "$KEYCHAIN"
+
+          echo "$CERT_P12" | base64 --decode > "$RUNNER_TEMP/macapk.p12"
+          security import "$RUNNER_TEMP/macapk.p12" \
+            -k "$KEYCHAIN" -P "$CERT_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
+          # Without the partition list the key cannot sign from a CI keychain.
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "ci-notary-keychain" "$KEYCHAIN" >/dev/null
+          security list-keychain -d user -s "$KEYCHAIN"
+          security unlock-keychain -p "ci-notary-keychain" "$KEYCHAIN"
+
+          echo "--- available identities ---"
+          security find-identity -v -p codesigning
+
+      # Write the notary key to disk and point the build at it. The .p8 is
+      # referenced BY PATH; nothing in the project ever reads its contents.
+      - name: Stage the notary credentials
+        id: notary
+        shell: bash
+        env:
+          NOTARY_KEY: ${{ secrets.MACAPK_NOTARY_KEY }}
+          NOTARY_KEY_ID: ${{ secrets.MACAPK_NOTARY_KEY_ID }}
+          NOTARY_ISSUER: ${{ secrets.MACAPK_NOTARY_ISSUER }}
+        run: |
+          set -euo pipefail
+          if [ -z "$NOTARY_KEY" ] || [ -z "$NOTARY_KEY_ID" ] || [ -z "$NOTARY_ISSUER" ]; then
+            echo "No notary secrets: skipping notarization."
+            echo "NOTARIZE=0" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          if [ "$AD_HOC" != "0" ]; then
+            echo "No Developer ID identity: an ad-hoc signature cannot be notarized."
+            echo "NOTARIZE=0" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          echo "$NOTARY_KEY" | base64 --decode > "$RUNNER_TEMP/AuthKey_${NOTARY_KEY_ID}.p8"
+          {
+            echo "MACAPK_NOTARY_KEY=$RUNNER_TEMP/AuthKey_${NOTARY_KEY_ID}.p8"
+            echo "MACAPK_NOTARY_KEY_ID=$NOTARY_KEY_ID"
+            echo "MACAPK_NOTARY_ISSUER=$NOTARY_ISSUER"
+            echo "NOTARIZE=1"
+          } >> "$GITHUB_ENV"
+
+      - name: Build
+        uses: ./.github/actions/build-macapk
+        with:
+          release-version: ${{ env.VERSION }}
+
+      # build_dist.sh --notarize (used above when the identity and the notary
+      # settings are all present) notarizes the app and the disk image and
+      # staples both. This step just proves it worked.
+      - name: Verify the notarization
+        if: env.NOTARIZE == '1'
+        shell: bash
+        run: |
+          set -euo pipefail
+          DMG=build/dist/macapk.dmg
+          xcrun stapler validate "$DMG"
+          spctl --assess --type open --context context:primary-signature -v "$DMG"
+          xcrun stapler validate build/dist/Mac.apk.app
+          spctl --assess --type execute --verbose=4 build/dist/Mac.apk.app
+
+      - name: Summarize the artifacts
+        shell: bash
+        run: |
+          ls -la build/dist/
+          du -sh build/dist/Mac.apk.app build/dist/macapk.dmg
+
+      - name: Publish to the GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          NOTES=$(mktemp)
+          {
+            echo "Mac.apk $VERSION for Apple Silicon."
+            echo
+            echo "Requires macOS 26.4 (Tahoe) or newer on Apple Silicon."
+            echo
+            echo "Drag Mac.apk into Applications, then open it and click Install next to Runtime."
+          } > "$NOTES"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" build/dist/macapk.dmg --clobber
+          else
+            gh release create "$TAG" build/dist/macapk.dmg \
+              --title "Mac.apk $VERSION" --notes-file "$NOTES"
+          fi
+          gh release view "$TAG"
+
+      - name: Upload the build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: macapk-release
+          path: |
+            build/dist/macapk.dmg
+            build/dist/Mac.apk.app
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Clean up the temporary keychain
+        if: always() && env.AD_HOC == '0'
+        shell: bash
+        run: security delete-keychain "$MACAPK_KEYCHAIN" || true

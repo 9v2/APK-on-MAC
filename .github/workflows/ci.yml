@@ -1,0 +1,51 @@
+# Build Mac.apk from source, on every push.
+#
+# WHY A WORKFLOW AT ALL. Mac.apk is a macOS project with a hard platform
+# floor: Apple Silicon, macOS 26.4+ (the arm64 guest path needs the
+# com.apple.security.custom-x18-abi-toggle entitlement, whose kernel support
+# landed in 26.4) and the macOS 26 SDK (PHAssetResource.contentType is
+# API_AVAILABLE(macos(26.0)). GitHub's macos-26 image is exactly that:
+# arm64, macOS 26.6.2, Xcode 26.6 with the macOS 26.5 SDK. So the build runs
+# here on the same architecture and OS generation the project targets, on a
+# machine that starts from a known-clean state every run.
+#
+# The build itself lives in .github/actions/build-macapk/action.yml, shared
+# with release.yml.
+
+name: Build
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+# One build per ref. A newer push to the same branch makes the older run
+# obsolete, so cancel it rather than burning runner minutes on it.
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build (macOS 26, Apple Silicon)
+    runs-on: macos-26
+    timeout-minutes: 90
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Build
+        uses: ./.github/actions/build-macapk
+
+      - name: Upload the build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: macapk-build
+          path: |
+            build/dist/macapk.dmg
+            build/dist/Mac.apk.app
+          if-no-files-found: error
+          retention-days: 14

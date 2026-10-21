@@ -1,0 +1,158 @@
+# The Mac.apk build, as a composite action.
+#
+# Both .github/workflows/ci.yml (every push) and .github/workflows/release.yml
+# (a version tag) call this, so there is exactly ONE definition of how the
+# project is built. If a step changes, it changes here.
+#
+# The steps are the ones BUILDING.md documents:
+#   scripts/check-requirements.sh   -> the report (see the note below)
+#   runtime/scripts/build.sh         -> runtime, framework jars, translator
+#   scripts/build_dist.sh --dmg      -> the .app bundle and the disk image
+#
+# scripts/build_dist.sh re-runs scripts/build_launcher.sh internally, so the
+# launcher is built as part of it.
+
+name: Build Mac.apk
+description: >-
+  Build Mac.apk (runtime, launcher, .app bundle and .dmg) on macOS 26 / Apple
+  Silicon, then verify the result.
+
+inputs:
+  release-version:
+    description: >-
+      Version number to bake into the launcher as the release version
+      ("1.0.2279"). Only a build that is actually PUBLISHED should set this:
+      the launcher compares it against the latest GitHub Release to decide
+      whether to offer an update, so every other build must leave it unset.
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Report the toolchain
+      shell: bash
+      run: |
+        echo "--- OS ---"
+        sw_vers
+        uname -m
+        echo "--- Xcode ---"
+        xcodebuild -version
+        echo "SDK: $(xcrun --show-sdk-path) ($(xcrun --show-sdk-version))"
+
+    # The build links against the macOS 26 SDK (PHAssetResource.contentType is
+    # API_AVAILABLE(macos(26.0)), used by runtime/src/photos_bridge.mm).
+    # Select the full Xcode rather than the Command Line Tools so the SDK and
+    # the Metal toolchain match the image's Xcode 26, and so xcrun resolves the
+    # same toolchain the rest of the build uses.
+    - name: Select the image's Xcode
+      shell: bash
+      run: |
+        if [ -d /Applications/Xcode.app ]; then
+          sudo xcode-select -s /Applications/Xcode.app
+          echo "DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer" >> "$GITHUB_ENV"
+        fi
+        xcode-select -p
+        echo "SDK: $(xcrun --show-sdk-path) ($(xcrun --show-sdk-version))"
+
+    # Every non-system dependency the build links against. The paths are
+    # hard-coded to /opt/homebrew (runtime/CMakeLists.txt and
+    # runtime/translator/CMakeLists.txt), which is the Homebrew prefix on the
+    # arm64 runner image.
+    #   cmake        native build orchestrator
+    #   openjdk@21   the JDK the runtime links libjvm from, and jlinks the JRE
+    #   capstone     the ARM32 instruction decoder the lifter needs
+    #   apktool      supplies the aapt2 that builds the platform resource apk
+    #   libpng       PNG decode override (optional, build warns without it)
+    #   libvpx       software VP8/VP9 decode (optional, build warns without it)
+    - name: Install the build dependencies
+      shell: bash
+      run: |
+        brew install cmake openjdk@21 capstone apktool libpng libvpx
+        echo "--- versions ---"
+        cmake --version | head -1
+        /opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home/bin/java -version
+        brew list --versions capstone apktool libpng libvpx
+
+    # The platform resource apk is built once from AOSP source (~23 MB fetch +
+    # ~30 s of aapt2) and is gitignored, so a fresh runner rebuilds it every
+    # time. Cache the finished apk to skip both.
+    - name: Cache the platform resource apk
+      uses: actions/cache@v4
+      with:
+        path: thirdparty/framework-res/framework-res-api36.apk
+        key: framework-res-api36-${{ hashFiles('scripts/build_framework_res.sh') }}
+
+    # check-requirements.sh prints the green/red report from BUILDING.md. It is
+    # run for the log, NOT as a gate: its Metal-toolchain row describes a
+    # from-source ANGLE build, and this tree ships the compiled ANGLE in
+    # thirdparty/angle-prebuilt (see the ANGLE row, which passes). The build
+    # itself is the gate.
+    - name: Check the requirements
+      shell: bash
+      run: scripts/check-requirements.sh || true
+
+    - name: Build the runtime
+      shell: bash
+      env:
+        MACAPK_JDK: "21"
+        JAVA_HOME: /opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home
+        MACAPK_RELEASE_VERSION: ${{ inputs.release-version }}
+      run: runtime/scripts/build.sh
+
+    # --notarize is added only when a signing identity AND all three notary
+    # settings are present: build_dist.sh checks the notary credentials first
+    # and refuses to start a notarization it cannot finish, and an ad-hoc
+    # signature cannot be notarized at all.
+    - name: Build the app and the disk image
+      shell: bash
+      env:
+        MACAPK_JDK: "21"
+        JAVA_HOME: /opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home
+        MACAPK_RELEASE_VERSION: ${{ inputs.release-version }}
+      run: |
+        set -euo pipefail
+        if [ -n "${MACAPK_SIGN_IDENTITY:-}" ] \
+           && [ -n "${MACAPK_NOTARY_KEY:-}" ] \
+           && [ -n "${MACAPK_NOTARY_KEY_ID:-}" ] \
+           && [ -n "${MACAPK_NOTARY_ISSUER:-}" ]; then
+          echo "Developer ID identity and notary credentials present: building a notarized release."
+          scripts/build_dist.sh --dmg --notarize
+        else
+          scripts/build_dist.sh --dmg
+        fi
+
+    # A build that links but does not load is not a build. --help exercises dyld
+    # on the runtime binary inside the signed bundle, which is where a stale
+    # absolute Homebrew path would show up.
+    - name: Smoke test the built runtime
+      shell: bash
+      run: |
+        RUNTIME=build/dist/Mac.apk.app/Contents/Resources/macapk-runtime
+        ls -la "$RUNTIME"
+        "$RUNTIME" --help
+
+    # Self-containment: the bundle has to run on a Mac with no Homebrew, no JDK
+    # and no Xcode, so nothing inside it may point at /opt/homebrew.
+    - name: Audit the bundle for external dependencies
+      shell: bash
+      run: scripts/audit_bundle_deps.sh build/dist/Mac.apk.app
+
+    # Every entitlement the runtime needs, including custom-x18-abi-toggle.
+    # Losing it is SILENT -- the build and the launch both succeed.
+    - name: Check the runtime entitlements
+      shell: bash
+      run: debug/entitlements_check.sh build/dist/Mac.apk.app/Contents/Resources/macapk-runtime
+
+    - name: Verify the signature
+      shell: bash
+      run: |
+        codesign --verify --deep --strict --verbose=2 build/dist/Mac.apk.app
+        spctl --assess --type execute --verbose=2 build/dist/Mac.apk.app || \
+          echo "(ad-hoc signature: spctl rejects it, which is expected for an unnotarized build)"
+
+    - name: Summarize the artifacts
+      shell: bash
+      run: |
+        ls -la build/dist/
+        du -sh build/dist/Mac.apk.app build/dist/macapk.dmg
