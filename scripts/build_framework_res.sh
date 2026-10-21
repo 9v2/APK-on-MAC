@@ -90,7 +90,15 @@ fi
 # what built the shipped API-36 apk (v1.0.1589). Extracted on demand.
 if [ -z "$AAPT2" ]; then
     KEG_JAR="$(ls -t /opt/homebrew/Cellar/apktool/*/libexec/apktool_*.jar 2>/dev/null | head -1)"
-    if [ -n "$KEG_JAR" ] && unzip -l "$KEG_JAR" 2>/dev/null | grep -q "prebuilt/macosx/aapt2"; then
+    # ⚠ NOT `unzip -l "$KEG_JAR" | grep -q "prebuilt/macosx/aapt2"`. Under
+    # `set -o pipefail` (this script sets it) the grep that exits on the
+    # first match kills unzip with SIGPIPE, so the PIPELINE reports failure
+    # and the branch never runs -- even though the aapt2 IS in the jar. It
+    # is a RACE: it fires when unzip still has output pending when grep
+    # exits, which depends on the jar's size, so it breaks on one machine
+    # and not the next. unzip exits 0 when the pattern matched and 11 when
+    # it did not, which is the answer we want, with no pipe to lose.
+    if [ -n "$KEG_JAR" ] && unzip -l "$KEG_JAR" "prebuilt/macosx/aapt2" >/dev/null 2>&1; then
         mkdir -p "$OUT_DIR/aapt2"
         unzip -p "$KEG_JAR" prebuilt/macosx/aapt2 > "$OUT_DIR/aapt2/aapt2" && chmod +x "$OUT_DIR/aapt2/aapt2" \
             && AAPT2="$OUT_DIR/aapt2/aapt2" && echo "aapt2: extracted from $KEG_JAR"

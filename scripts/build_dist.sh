@@ -238,6 +238,115 @@ chg() {  # $1 binary  $2 match-substring  $3 new @rpath target
 # @loader_path-relative path from a Mach-O file's directory to Contents/Frameworks.
 fw_rpath_for() { python3 -c "import os; print('@loader_path/'+os.path.relpath('$FW', os.path.dirname('$1')))"; }
 
+# The LC_RPATH entries of a Mach-O file, with @loader_path / @executable_path
+# expanded to absolute directories.
+#
+# Read this BEFORE del_opt_rpaths strips the /opt ones: an @rpath dependency
+# is resolved THROUGH them, so they are the only record of where the file it
+# names actually lives.
+rpaths_of() {
+    local f="$1" rp dir
+    dir="$(dirname -- "$f")"
+    otool -l "$f" 2>/dev/null \
+        | awk '/cmd LC_RPATH/{g=1} g&&/path /{print $2; g=0}' \
+        | while read -r rp; do
+            case "$rp" in
+                @loader_path/*)     printf '%s\n' "$dir/${rp#@loader_path/}" ;;
+                @executable_path/*) printf '%s\n' "$dir/${rp#@executable_path/}" ;;
+                *)                  printf '%s\n' "$rp" ;;
+            esac
+        done || true
+}
+
+# True when the file already carries this exact LC_RPATH. Returns 0 for yes,
+# 1 for no -- so it can be used as `if ! has_rpath ...` and NOT as a value.
+has_rpath() {  # $1 = file   $2 = the rpath string
+    otool -l "$1" 2>/dev/null \
+        | awk -v want="$2" '/cmd LC_RPATH/{g=1} g&&/path /{if ($2 == want) found=1; g=0} END{exit(found?0:1)}'
+}
+
+# Resolve one "@rpath/name" reference against the rpath list of $2. Prints
+# the file it names, or fails.
+resolve_rpath_ref() {  # $1 = @rpath/name   $2 = the file whose rpaths apply
+    local ref="$1" f="$2" name rp
+    name="${ref#@rpath/}"
+    while read -r rp; do
+        [ -n "$rp" ] || continue
+        if [ -f "$rp/$name" ]; then printf '%s\n' "$rp/$name"; return 0; fi
+    done <<EOF
+$(rpaths_of "$f")
+EOF
+    return 1
+}
+
+# True when every @rpath the file names is a file in Frameworks/.
+all_rpath_deps_bundled() {  # $1 = the file to check
+    local f="$1" r name
+    while read -r r; do
+        [ -n "$r" ] || continue
+        name="${r#@rpath/}"
+        [ -f "$FW/$name" ] || return 1
+    done <<EOF
+$(otool -L "$f" 2>/dev/null | awk 'NR>1{print $1}' | grep -E '^@rpath/' || true)
+EOF
+    return 0
+}
+
+# Copy a non-system dylib into Contents/Frameworks, together with the
+# @rpath dependencies IT names.
+#
+# WHY THE RECURSION. Homebrew builds its dylibs with @rpath references to
+# their siblings, not absolute ones:
+#
+#   libfreetype.6.dylib  ->  /opt/homebrew/opt/brotli/lib/libbrotlidec.1.dylib  (absolute)
+#   libbrotlidec.1.dylib ->  @rpath/libbrotlicommon.1.dylib                     (@rpath!)
+#
+# The FIRST line is what relocate_recursive() handles: an absolute
+# dependency is copied into Frameworks/ and rewritten to @rpath. The SECOND
+# line is what it did not handle, and it is fatal: the copy in Frameworks/
+# still asks for its sibling by @rpath, and the Homebrew cellar rpath that
+# used to answer that question is removed below -- a target Mac has no
+# Homebrew -- so libbrotlicommon can never be found. The bundle then loads
+# a dylib whose dependency is missing, and java.desktop dies on the first
+# font.
+#
+# debug/dist_parity.sh check (e) is what caught it: that check stages what
+# the installer stages and asks whether every @rpath still resolves.
+bundle_dylib() {  # $1 = absolute path of the dylib to bundle
+    local src="$1" base r cand
+    base="$(basename "$src")"
+    [ -f "$FW/$base" ] && return 0
+    cp "$src" "$FW/$base"
+    chmod u+w "$FW/$base"
+    install_name_tool -id "@rpath/$base" "$FW/$base" 2>/dev/null || true
+    # The copy looks for its siblings where THEY are bundled, not in the
+    # cellar it came from.
+    if ! has_rpath "$FW/$base" "@loader_path"; then
+        install_name_tool -add_rpath "@loader_path" "$FW/$base" 2>/dev/null || true
+    fi
+    # Its siblings come along. Resolved against the SOURCE, whose Homebrew
+    # rpaths are still intact -- the copy's are about to be removed.
+    while read -r r; do
+        [ -n "$r" ] || continue
+        cand="$(resolve_rpath_ref "$r" "$src" || true)"
+        [ -n "$cand" ] || continue
+        case "$cand" in
+            /opt/*|/usr/local/*) bundle_dylib "$cand" ;;
+        esac
+    done <<EOF
+$(otool -L "$src" 2>/dev/null | awk 'NR>1{print $1}' | grep -E '^@rpath/' || true)
+EOF
+    # Only now drop the cellar rpaths: every @rpath the copy names is a file
+    # in Frameworks/, so nothing needs the cellar any more. If something did
+    # NOT get bundled, keep the cellar rpath rather than break it -- it is
+    # dead weight on a clean Mac, but it still works on a dev machine.
+    if all_rpath_deps_bundled "$FW/$base"; then
+        del_opt_rpaths "$FW/$base"
+    else
+        echo "  WARN: $base names an @rpath dependency that is not bundled; keeping its cellar rpath"
+    fi
+}
+
 # ---------------------------------------------------------------------------
 # 1c. REMOVED at v1.0.802 -- there is no LLVM toolchain to bundle any more.
 #     The ARM32 path used to need a bundled SDK-free llvm-as/llc/ld64.lld so a
@@ -283,11 +392,7 @@ relocate_recursive() {
             install_name_tool -add_rpath "$rp" "$f" 2>/dev/null || true
             for dep in $deps; do
                 base="$(basename "$dep")"
-                if [ ! -f "$FW/$base" ]; then
-                    cp "$dep" "$FW/$base"
-                    chmod u+w "$FW/$base"
-                    install_name_tool -id "@rpath/$base" "$FW/$base"
-                fi
+                bundle_dylib "$dep"
                 install_name_tool -change "$dep" "@rpath/$base" "$f" 2>/dev/null || true
             done
         done < <(find "$APP" -type f \( -name '*.dylib' -o -name '*.so' -o -perm -u+x \))
