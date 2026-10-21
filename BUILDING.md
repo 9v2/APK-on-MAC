@@ -58,6 +58,31 @@ scripts/build_angle.sh
 
 That pulls about 25 GB and takes 30 to 60 minutes the first time.
 
+## Building on GitHub Actions
+
+The build runs on GitHub's `macos-26` runner: Apple Silicon, macOS 26.6.2,
+Xcode 26.6 with the macOS 26.5 SDK. That is the project's target platform --
+the arm64 guest path needs the macOS 26.4+ kernel and the build needs the
+macOS 26 SDK (`PHAssetResource.contentType` is `API_AVAILABLE(macos(26.0))`),
+so nothing is emulated and no local Mac is required.
+
+| Workflow | Trigger | What it does |
+|---|---|---|
+| `.github/workflows/ci.yml` | every push to `main`, every pull request | Builds the runtime, the app and the `.dmg`, verifies the result, uploads the artifacts |
+| `.github/workflows/release.yml` | a `v<VERSION>` tag | The same build with the release version baked in, then publishes the `.dmg` to the GitHub Release |
+
+Both call the same composite action, `.github/actions/build-macapk/action.yml`,
+so there is exactly one definition of how the project is built. It runs the
+steps above in the documented order and then checks the result: the runtime
+binary loads (`--help`), the bundle is self-contained
+(`scripts/audit_bundle_deps.sh`), every required entitlement is present
+(`debug/entitlements_check.sh`) and the signature verifies.
+
+The release workflow signs and notarizes when the repository secrets
+`MACAPK_CERT_P12`, `MACAPK_CERT_PASSWORD`, `MACAPK_SIGN_IDENTITY`,
+`MACAPK_NOTARY_KEY`, `MACAPK_NOTARY_KEY_ID` and `MACAPK_NOTARY_ISSUER` are
+set, and builds an ad-hoc signed `.dmg` otherwise.
+
 ## Signed builds
 
 `scripts/build_dist.sh --dmg` makes an ad-hoc signed app and disk image.
