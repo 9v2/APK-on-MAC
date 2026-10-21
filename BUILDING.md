@@ -81,7 +81,28 @@ binary loads (`--help`), the bundle is self-contained
 The release workflow signs and notarizes when the repository secrets
 `MACAPK_CERT_P12`, `MACAPK_CERT_PASSWORD`, `MACAPK_SIGN_IDENTITY`,
 `MACAPK_NOTARY_KEY`, `MACAPK_NOTARY_KEY_ID` and `MACAPK_NOTARY_ISSUER` are
-set, and builds an ad-hoc signed `.dmg` otherwise.
+set. Without them the build is ad-hoc signed, and the workflow creates the
+release as a **draft**: a downloaded ad-hoc signed app is refused by
+Gatekeeper, so publishing one publicly would hand out a file nobody can
+open. With the secrets set, the release is signed, notarized, stapled and
+published for real.
+
+## Building on a Mac without Xcode 26
+
+The build needs the macOS 26 SDK (`PHAssetResource.contentType` is
+`API_AVAILABLE(macos(26.0))`) and a linker that can read it. If the machine
+has a full Xcode 26, `xcode-select -s /Applications/Xcode.app` is all it
+needs. If only the Command Line Tools are installed and they are older than
+the SDK, a matching SDK and toolchain can be unpacked without root and
+pointed at with `DEVELOPER_DIR`, `SDKROOT` and `PATH`:
+
+```bash
+TC=~/Library/Developer/macapk-toolchain
+export DEVELOPER_DIR=/Library/Developer/CommandLineTools   # xcrun needs a real developer dir
+export SDKROOT=$TC/SDKs/MacOSX26.5.sdk
+export PATH=$TC/usr/bin:$PATH
+runtime/scripts/build.sh
+```
 
 ## Signed builds
 
